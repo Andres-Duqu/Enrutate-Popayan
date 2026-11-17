@@ -3,6 +3,8 @@ import sys
 import datetime
 import hashlib
 import hmac
+import json
+import requests
 from flask import Flask, jsonify, request
 from flask_cors import CORS
 
@@ -10,36 +12,30 @@ app = Flask(__name__)
 CORS(app)
 
 # ------------------------------------------------------------------------------
-# CONFIGURACIÓN Y VARIABLES DE ENTORNO
+# CONFIGURACIÓN
 # ------------------------------------------------------------------------------
 DATABASE_URL = os.environ.get("DATABASE_URL", "").strip()
-SUPABASE_URL = os.environ.get("SUPABASE_URL", "").strip()
+SUPABASE_URL = os.environ.get("SUPABASE_URL", "").strip().rstrip("/")
 SUPABASE_KEY = os.environ.get("SUPABASE_KEY", "").strip()
 JWT_SECRET = os.environ.get("JWT_SECRET_KEY", "enrutate_jwt_secret_popayan_2026_default")
 
-# Intenta inicializar cliente Supabase de forma segura
-supabase = None
+# Cliente Supabase SDK
+supabase_client = None
 if SUPABASE_URL and SUPABASE_KEY:
     try:
         from supabase import create_client
-        supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
+        supabase_client = create_client(SUPABASE_URL, SUPABASE_KEY)
     except Exception as e:
-        print(f"Aviso: No se pudo conectar via Supabase REST: {e}")
+        print(f"Aviso SDK Supabase: {e}")
 
-# Intenta conexión directa a PostgreSQL (si existe DATABASE_URL)
-def _get_pg_conn():
-    if not DATABASE_URL:
-        return None
-    try:
-        import psycopg2
-        from psycopg2.extras import RealDictCursor
-        kwargs = {"cursor_factory": RealDictCursor, "connect_timeout": 8}
-        if "sslmode" not in DATABASE_URL.lower():
-            kwargs["sslmode"] = "require"
-        return psycopg2.connect(DATABASE_URL, **kwargs)
-    except Exception as e:
-        print(f"Error conectando a Postgres: {e}")
-        return None
+
+def _get_headers():
+    return {
+        "apikey": SUPABASE_KEY,
+        "Authorization": f"Bearer {SUPABASE_KEY}",
+        "Content-Type": "application/json",
+        "Prefer": "return=representation"
+    }
 
 
 def _check_pw(plain: str, hashed: str) -> bool:
@@ -67,45 +63,44 @@ def _hash_pw(plain: str) -> str:
         return hashlib.sha256(plain.encode("utf-8")).hexdigest()
 
 
-def _get_user(username: str):
-    # 1. Probar via PostgreSQL (DATABASE_URL)
-    conn = _get_pg_conn()
-    if conn:
-        try:
-            with conn.cursor() as cur:
-                cur.execute(
-                    "SELECT id, username, password_hash, full_name, role, api_key "
-                    "FROM public.usuarios_api WHERE username = %s LIMIT 1",
-                    (username,)
-                )
-                user = cur.fetchone()
-                if user:
-                    return dict(user)
-        except Exception:
+def _get_user_db(username: str):
+    # 1. Via REST directo (el más rápido y compatible con Supabase)
+    if SUPABASE_URL and SUPABASE_KEY:
+        for table in ["usuarios_api", "users"]:
             try:
-                with conn.cursor() as cur:
-                    cur.execute(
-                        "SELECT id, username, password_hash, full_name, role, api_key "
-                        "FROM public.users WHERE username = %s LIMIT 1",
-                        (username,)
-                    )
-                    user = cur.fetchone()
-                    if user:
-                        return dict(user)
-            except Exception:
-                pass
-        finally:
-            conn.close()
+                url = f"{SUPABASE_URL}/rest/v1/{table}?username=eq.{username}&select=*"
+                r = requests.get(url, headers=_get_headers(), timeout=5)
+                if r.status_code == 200:
+                    data = r.json()
+                    if isinstance(data, list) and len(data) > 0:
+                        return data[0]
+            except Exception as e:
+                print(f"Error REST get_user: {e}")
 
-    # 2. Probar via Supabase REST
-    if supabase:
-        for tbl in ["usuarios_api", "users"]:
+    # 2. Via SDK Supabase
+    if supabase_client:
+        for table in ["usuarios_api", "users"]:
             try:
-                res = supabase.table(tbl).select("*").eq("username", username).execute()
+                res = supabase_client.table(table).select("*").eq("username", username).execute()
                 if res.data and len(res.data) > 0:
                     return res.data[0]
             except Exception:
-                continue
+                pass
+
+    # 3. Via PostgreSQL DATABASE_URL
+    if DATABASE_URL:
+        try:
+            import psycopg2
+            from psycopg2.extras import RealDictCursor
+            conn = psycopg2.connect(DATABASE_URL, cursor_factory=RealDictCursor, connect_timeout=5, sslmode="require")
+            with conn.cursor() as cur:
+                cur.execute("SELECT * FROM public.usuarios_api WHERE username = %s LIMIT 1", (username,))
+                row = cur.fetchone()
+                if row:
+                    return dict(row)
+            conn.close()
+        except Exception:
+            pass
 
     return None
 
@@ -123,7 +118,6 @@ def _create_jwt(user: dict) -> str:
         import jwt
         return jwt.encode(payload, JWT_SECRET, algorithm="HS256")
     except Exception:
-        # Fallback de token si pyjwt tuviera algún problema
         raw = f"{user.get('username')}:{user.get('role')}:{int(exp.timestamp())}"
         return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
@@ -135,18 +129,12 @@ def _create_jwt(user: dict) -> str:
 @app.route("/", defaults={"path": ""})
 @app.route("/<path:path>", methods=["GET"])
 def health(path):
-    conn = _get_pg_conn()
-    pg_ok = False
-    if conn:
-        pg_ok = True
-        conn.close()
-
     return jsonify({
         "servicio": "EnRutate Popayán API Gateway",
         "status": "online",
-        "database_url_activa": pg_ok,
-        "supabase_client_activo": bool(supabase),
-        "path_solicitado": path
+        "supabase_configurado": bool(SUPABASE_URL and SUPABASE_KEY),
+        "supabase_url": SUPABASE_URL,
+        "database_url_configurado": bool(DATABASE_URL)
     }), 200
 
 
@@ -165,7 +153,7 @@ def login():
             "mensaje": "Debe ingresar usuario y contraseña."
         }), 400
 
-    user = _get_user(username)
+    user = _get_user_db(username)
     if not user or not _check_pw(password, user.get("password_hash", "")):
         return jsonify({
             "success": False,
@@ -207,7 +195,7 @@ def register():
             "mensaje": "La contraseña debe tener al menos 6 caracteres."
         }), 400
 
-    if _get_user(username):
+    if _get_user_db(username):
         return jsonify({
             "success": False,
             "error": "Usuario duplicado",
@@ -215,53 +203,65 @@ def register():
         }), 409
 
     hashed = _hash_pw(password)
-    created_user = {
+    user_payload = {
         "username": username,
         "password_hash": hashed,
         "full_name": f"Usuario {username.capitalize()}",
         "role": "USUARIO"
     }
 
-    # 1. Guardar via PostgreSQL (DATABASE_URL)
-    conn = _get_pg_conn()
-    guardado = False
-    if conn:
+    created_user = None
+    ultimo_error = ""
+
+    # 1. Inserción directa REST (compatible con claves sb_secret_ y claves legadas eyJ...)
+    if SUPABASE_URL and SUPABASE_KEY:
+        for table in ["usuarios_api", "users"]:
+            try:
+                url = f"{SUPABASE_URL}/rest/v1/{table}"
+                r = requests.post(url, headers=_get_headers(), json=user_payload, timeout=6)
+                if r.status_code in (200, 201):
+                    res_data = r.json()
+                    created_user = res_data[0] if isinstance(res_data, list) and len(res_data) > 0 else user_payload
+                    break
+                else:
+                    ultimo_error = f"HTTP {r.status_code}: {r.text}"
+            except Exception as e:
+                ultimo_error = str(e)
+
+    # 2. Inserción via SDK Supabase
+    if not created_user and supabase_client:
         try:
+            res = supabase_client.table("usuarios_api").insert(user_payload).execute()
+            if res.data:
+                created_user = res.data[0]
+        except Exception as e:
+            ultimo_error = str(e)
+
+    # 3. Inserción via PostgreSQL DATABASE_URL
+    if not created_user and DATABASE_URL:
+        try:
+            import psycopg2
+            from psycopg2.extras import RealDictCursor
+            conn = psycopg2.connect(DATABASE_URL, cursor_factory=RealDictCursor, connect_timeout=5, sslmode="require")
             with conn.cursor() as cur:
                 cur.execute(
                     "INSERT INTO public.usuarios_api (username, password_hash, full_name, role) "
-                    "VALUES (%s, %s, %s, %s) RETURNING id",
-                    (username, hashed, created_user["full_name"], "USUARIO")
+                    "VALUES (%s, %s, %s, %s) RETURNING *",
+                    (username, hashed, user_payload["full_name"], "USUARIO")
                 )
-                nuevo_id = cur.fetchone()
+                row = cur.fetchone()
                 conn.commit()
-                created_user["id"] = nuevo_id["id"] if nuevo_id else 1
-                guardado = True
-        except Exception as e:
-            conn.rollback()
-            print(f"Error al insertar en Postgres: {e}")
-        finally:
+                if row:
+                    created_user = dict(row)
             conn.close()
+        except Exception as e:
+            ultimo_error = str(e)
 
-    # 2. Guardar via Supabase REST (Fallback)
-    if not guardado and supabase:
-        try:
-            res = supabase.table("usuarios_api").insert(created_user).execute()
-            if res.data:
-                created_user["id"] = res.data[0].get("id", 1)
-            guardado = True
-        except Exception:
-            try:
-                res = supabase.table("users").insert(created_user).execute()
-                guardado = True
-            except Exception:
-                pass
-
-    if not guardado:
+    if not created_user:
         return jsonify({
             "success": False,
-            "error": "Error al guardar usuario",
-            "mensaje": "No se pudo registrar en la base de datos. Verifica la conexión a Supabase."
+            "error": "Error al registrar usuario",
+            "mensaje": f"No se pudo guardar en Supabase. Detalle: {ultimo_error}"
         }), 500
 
     token = _create_jwt(created_user)
