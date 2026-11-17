@@ -1,29 +1,45 @@
 import os
+import sys
 import datetime
 import hashlib
 import hmac
 from flask import Flask, jsonify, request
 from flask_cors import CORS
-from supabase import create_client
-from werkzeug.security import generate_password_hash, check_password_hash
-import jwt
 
 app = Flask(__name__)
 CORS(app)
 
 # ------------------------------------------------------------------------------
-# CONEXIÓN A SUPABASE
+# CONFIGURACIÓN Y VARIABLES DE ENTORNO
 # ------------------------------------------------------------------------------
-SUPABASE_URL = os.environ.get("SUPABASE_URL", "")
-SUPABASE_KEY = os.environ.get("SUPABASE_KEY", "")
+DATABASE_URL = os.environ.get("DATABASE_URL", "").strip()
+SUPABASE_URL = os.environ.get("SUPABASE_URL", "").strip()
+SUPABASE_KEY = os.environ.get("SUPABASE_KEY", "").strip()
 JWT_SECRET = os.environ.get("JWT_SECRET_KEY", "enrutate_jwt_secret_popayan_2026_default")
 
+# Intenta inicializar cliente Supabase de forma segura
 supabase = None
 if SUPABASE_URL and SUPABASE_KEY:
     try:
+        from supabase import create_client
         supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
     except Exception as e:
-        print(f"Error conectando a Supabase: {e}")
+        print(f"Aviso: No se pudo conectar via Supabase REST: {e}")
+
+# Intenta conexión directa a PostgreSQL (si existe DATABASE_URL)
+def _get_pg_conn():
+    if not DATABASE_URL:
+        return None
+    try:
+        import psycopg2
+        from psycopg2.extras import RealDictCursor
+        kwargs = {"cursor_factory": RealDictCursor, "connect_timeout": 8}
+        if "sslmode" not in DATABASE_URL.lower():
+            kwargs["sslmode"] = "require"
+        return psycopg2.connect(DATABASE_URL, **kwargs)
+    except Exception as e:
+        print(f"Error conectando a Postgres: {e}")
+        return None
 
 
 def _check_pw(plain: str, hashed: str) -> bool:
@@ -31,29 +47,66 @@ def _check_pw(plain: str, hashed: str) -> bool:
         return False
     if plain == hashed:
         return True
-    if hashed.startswith(("scrypt:", "pbkdf2:")):
-        try:
+    try:
+        from werkzeug.security import check_password_hash
+        if hashed.startswith(("scrypt:", "pbkdf2:")):
             return check_password_hash(hashed, plain)
-        except Exception:
-            pass
+    except Exception:
+        pass
     if len(hashed) == 64:
         legacy = hashlib.sha256(plain.encode("utf-8")).hexdigest()
         return hmac.compare_digest(legacy, hashed)
     return False
 
 
-def _get_user_by_username(username: str):
-    if not supabase:
-        return None
-    for table_name in ["usuarios_api", "users", "usuarios"]:
+def _hash_pw(plain: str) -> str:
+    try:
+        from werkzeug.security import generate_password_hash
+        return generate_password_hash(plain)
+    except Exception:
+        return hashlib.sha256(plain.encode("utf-8")).hexdigest()
+
+
+def _get_user(username: str):
+    # 1. Probar via PostgreSQL (DATABASE_URL)
+    conn = _get_pg_conn()
+    if conn:
         try:
-            res = supabase.table(table_name).select("*").eq("username", username).execute()
-            if res.data and len(res.data) > 0:
-                user = res.data[0]
-                user["_table"] = table_name
-                return user
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT id, username, password_hash, full_name, role, api_key "
+                    "FROM public.usuarios_api WHERE username = %s LIMIT 1",
+                    (username,)
+                )
+                user = cur.fetchone()
+                if user:
+                    return dict(user)
         except Exception:
-            continue
+            try:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        "SELECT id, username, password_hash, full_name, role, api_key "
+                        "FROM public.users WHERE username = %s LIMIT 1",
+                        (username,)
+                    )
+                    user = cur.fetchone()
+                    if user:
+                        return dict(user)
+            except Exception:
+                pass
+        finally:
+            conn.close()
+
+    # 2. Probar via Supabase REST
+    if supabase:
+        for tbl in ["usuarios_api", "users"]:
+            try:
+                res = supabase.table(tbl).select("*").eq("username", username).execute()
+                if res.data and len(res.data) > 0:
+                    return res.data[0]
+            except Exception:
+                continue
+
     return None
 
 
@@ -66,24 +119,41 @@ def _create_jwt(user: dict) -> str:
         "full_name": user.get("full_name", user.get("username", "")),
         "exp": exp
     }
-    return jwt.encode(payload, JWT_SECRET, algorithm="HS256")
+    try:
+        import jwt
+        return jwt.encode(payload, JWT_SECRET, algorithm="HS256")
+    except Exception:
+        # Fallback de token si pyjwt tuviera algún problema
+        raw = f"{user.get('username')}:{user.get('role')}:{int(exp.timestamp())}"
+        return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
 
 # ==============================================================================
-# RUTAS DE AUTENTICACIÓN (LOGIN, REGISTRO, PERFIL)
+# ENDPOINTS
 # ==============================================================================
+
+@app.route("/", defaults={"path": ""})
+@app.route("/<path:path>", methods=["GET"])
+def health(path):
+    conn = _get_pg_conn()
+    pg_ok = False
+    if conn:
+        pg_ok = True
+        conn.close()
+
+    return jsonify({
+        "servicio": "EnRutate Popayán API Gateway",
+        "status": "online",
+        "database_url_activa": pg_ok,
+        "supabase_client_activo": bool(supabase),
+        "path_solicitado": path
+    }), 200
+
 
 @app.route("/login", methods=["POST"])
 @app.route("/api/login", methods=["POST"])
 @app.route("/api/servicio_monitoreo/login", methods=["POST"])
 def login():
-    if not supabase:
-        return jsonify({
-            "success": False,
-            "error": "Base de datos no configurada",
-            "mensaje": "Verifica las variables SUPABASE_URL y SUPABASE_KEY en Vercel."
-        }), 500
-
     data = request.get_json(silent=True) or {}
     username = str(data.get("username", "")).strip()
     password = str(data.get("password", "")).strip()
@@ -95,7 +165,7 @@ def login():
             "mensaje": "Debe ingresar usuario y contraseña."
         }), 400
 
-    user = _get_user_by_username(username)
+    user = _get_user(username)
     if not user or not _check_pw(password, user.get("password_hash", "")):
         return jsonify({
             "success": False,
@@ -119,13 +189,6 @@ def login():
 @app.route("/api/register", methods=["POST"])
 @app.route("/api/servicio_monitoreo/register", methods=["POST"])
 def register():
-    if not supabase:
-        return jsonify({
-            "success": False,
-            "error": "Base de datos no configurada",
-            "mensaje": "Verifica las variables SUPABASE_URL y SUPABASE_KEY en Vercel."
-        }), 500
-
     data = request.get_json(silent=True) or {}
     username = str(data.get("username", "")).strip()
     password = str(data.get("password", "")).strip()
@@ -144,40 +207,64 @@ def register():
             "mensaje": "La contraseña debe tener al menos 6 caracteres."
         }), 400
 
-    if _get_user_by_username(username):
+    if _get_user(username):
         return jsonify({
             "success": False,
             "error": "Usuario duplicado",
             "mensaje": f"El usuario '{username}' ya está registrado."
         }), 409
 
-    hashed = generate_password_hash(password)
-    target_table = "usuarios_api"
-
-    new_user = {
+    hashed = _hash_pw(password)
+    created_user = {
         "username": username,
         "password_hash": hashed,
         "full_name": f"Usuario {username.capitalize()}",
         "role": "USUARIO"
     }
 
-    try:
-        res = supabase.table(target_table).insert(new_user).execute()
-        created = res.data[0] if res.data else new_user
-    except Exception as e:
-        # Intenta en tabla users si usuarios_api falla
+    # 1. Guardar via PostgreSQL (DATABASE_URL)
+    conn = _get_pg_conn()
+    guardado = False
+    if conn:
         try:
-            target_table = "users"
-            res = supabase.table(target_table).insert(new_user).execute()
-            created = res.data[0] if res.data else new_user
-        except Exception as e2:
-            return jsonify({
-                "success": False,
-                "error": "Error al registrar",
-                "mensaje": str(e2)
-            }), 500
+            with conn.cursor() as cur:
+                cur.execute(
+                    "INSERT INTO public.usuarios_api (username, password_hash, full_name, role) "
+                    "VALUES (%s, %s, %s, %s) RETURNING id",
+                    (username, hashed, created_user["full_name"], "USUARIO")
+                )
+                nuevo_id = cur.fetchone()
+                conn.commit()
+                created_user["id"] = nuevo_id["id"] if nuevo_id else 1
+                guardado = True
+        except Exception as e:
+            conn.rollback()
+            print(f"Error al insertar en Postgres: {e}")
+        finally:
+            conn.close()
 
-    token = _create_jwt(created)
+    # 2. Guardar via Supabase REST (Fallback)
+    if not guardado and supabase:
+        try:
+            res = supabase.table("usuarios_api").insert(created_user).execute()
+            if res.data:
+                created_user["id"] = res.data[0].get("id", 1)
+            guardado = True
+        except Exception:
+            try:
+                res = supabase.table("users").insert(created_user).execute()
+                guardado = True
+            except Exception:
+                pass
+
+    if not guardado:
+        return jsonify({
+            "success": False,
+            "error": "Error al guardar usuario",
+            "mensaje": "No se pudo registrar en la base de datos. Verifica la conexión a Supabase."
+        }), 500
+
+    token = _create_jwt(created_user)
     return jsonify({
         "success": True,
         "token": token,
@@ -197,6 +284,7 @@ def me():
 
     token = auth_header.split(" ", 1)[1].strip()
     try:
+        import jwt
         payload = jwt.decode(token, JWT_SECRET, algorithms=["HS256"])
         return jsonify({
             "success": True,
@@ -208,67 +296,5 @@ def me():
         return jsonify({"error": "Token inválido o expirado"}), 401
 
 
-# ==============================================================================
-# RUTAS DE TRANSPORTE Y OPERACIONES
-# ==============================================================================
-
-@app.route("/rutas", methods=["GET"])
-@app.route("/api/rutas", methods=["GET"])
-def listar_rutas():
-    if not supabase:
-        return jsonify([]), 200
-    for tbl in ["rutas", "routes"]:
-        try:
-            res = supabase.table(tbl).select("*").execute()
-            if res.data:
-                return jsonify(res.data), 200
-        except Exception:
-            continue
-    return jsonify([]), 200
-
-
-@app.route("/paradas", methods=["GET"])
-@app.route("/api/paradas", methods=["GET"])
-def listar_paradas():
-    if not supabase:
-        return jsonify([]), 200
-    for tbl in ["paradas", "stops"]:
-        try:
-            res = supabase.table(tbl).select("*").execute()
-            if res.data:
-                return jsonify(res.data), 200
-        except Exception:
-            continue
-    return jsonify([]), 200
-
-
-# ==============================================================================
-# COMPATIBILIDAD CON LA GUÍA (TAREAS)
-# ==============================================================================
-
-@app.route("/tareas", methods=["GET"])
-@app.route("/api/tareas", methods=["GET"])
-def listar_tareas():
-    if not supabase:
-        return jsonify([]), 200
-    try:
-        res = supabase.table("tareas").select("*").order("id").execute()
-        return jsonify(res.data or []), 200
-    except Exception:
-        return jsonify([]), 200
-
-
-@app.route("/", defaults={"path": ""})
-@app.route("/<path:path>")
-def catch_all(path):
-    return jsonify({
-        "servicio": "EnRutate Popayán API Gateway",
-        "status": "online",
-        "supabase": bool(supabase),
-        "path": path
-    }), 200
-
-
 if __name__ == "__main__":
     app.run(debug=True, port=5000)
-
