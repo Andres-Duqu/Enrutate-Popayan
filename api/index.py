@@ -4,6 +4,7 @@ import datetime
 import hashlib
 import hmac
 import json
+import base64
 import requests
 from flask import Flask, jsonify, request
 from flask_cors import CORS
@@ -12,14 +13,33 @@ app = Flask(__name__)
 CORS(app)
 
 # ------------------------------------------------------------------------------
-# CONFIGURACIÓN
+# CONFIGURACIÓN Y AUTO-DETECCIÓN DE VARIABLES
 # ------------------------------------------------------------------------------
 DATABASE_URL = os.environ.get("DATABASE_URL", "").strip()
 SUPABASE_URL = os.environ.get("SUPABASE_URL", "").strip().rstrip("/")
 SUPABASE_KEY = os.environ.get("SUPABASE_KEY", "").strip()
 JWT_SECRET = os.environ.get("JWT_SECRET_KEY", "enrutate_jwt_secret_popayan_2026_default")
 
-# Cliente Supabase SDK
+# Si falta SUPABASE_URL en Vercel, auto-detectarlo
+if not SUPABASE_URL:
+    if SUPABASE_KEY and SUPABASE_KEY.startswith("eyJ"):
+        try:
+            parts = SUPABASE_KEY.split(".")
+            if len(parts) >= 2:
+                pad = len(parts[1]) % 4
+                padded = parts[1] + ("=" * (4 - pad) if pad else "")
+                payload_json = json.loads(base64.urlsafe_b64decode(padded).decode("utf-8"))
+                project_ref = payload_json.get("ref")
+                if project_ref:
+                    SUPABASE_URL = f"https://{project_ref}.supabase.co"
+        except Exception as e:
+            print(f"Error decodificando ref de JWT: {e}")
+
+    # Fallback al ID del proyecto enrutate si no se definió
+    if not SUPABASE_URL:
+        SUPABASE_URL = "https://ppnonvpaqxmmnvayjuaw.supabase.co"
+
+# Cliente Supabase SDK (si se puede crear)
 supabase_client = None
 if SUPABASE_URL and SUPABASE_KEY:
     try:
@@ -87,21 +107,6 @@ def _get_user_db(username: str):
             except Exception:
                 pass
 
-    # 3. Via PostgreSQL DATABASE_URL
-    if DATABASE_URL:
-        try:
-            import psycopg2
-            from psycopg2.extras import RealDictCursor
-            conn = psycopg2.connect(DATABASE_URL, cursor_factory=RealDictCursor, connect_timeout=5, sslmode="require")
-            with conn.cursor() as cur:
-                cur.execute("SELECT * FROM public.usuarios_api WHERE username = %s LIMIT 1", (username,))
-                row = cur.fetchone()
-                if row:
-                    return dict(row)
-            conn.close()
-        except Exception:
-            pass
-
     return None
 
 
@@ -134,7 +139,8 @@ def health(path):
         "status": "online",
         "supabase_configurado": bool(SUPABASE_URL and SUPABASE_KEY),
         "supabase_url": SUPABASE_URL,
-        "database_url_configurado": bool(DATABASE_URL)
+        "key_presente": bool(SUPABASE_KEY),
+        "key_tipo": "JWT" if SUPABASE_KEY.startswith("eyJ") else ("Secret" if SUPABASE_KEY.startswith("sb_") else "Otro")
     }), 200
 
 
@@ -213,7 +219,7 @@ def register():
     created_user = None
     ultimo_error = ""
 
-    # 1. Inserción directa REST (compatible con claves sb_secret_ y claves legadas eyJ...)
+    # 1. Inserción directa REST (compatible con claves sb_secret_ y claves eyJ...)
     if SUPABASE_URL and SUPABASE_KEY:
         for table in ["usuarios_api", "users"]:
             try:
@@ -237,31 +243,11 @@ def register():
         except Exception as e:
             ultimo_error = str(e)
 
-    # 3. Inserción via PostgreSQL DATABASE_URL
-    if not created_user and DATABASE_URL:
-        try:
-            import psycopg2
-            from psycopg2.extras import RealDictCursor
-            conn = psycopg2.connect(DATABASE_URL, cursor_factory=RealDictCursor, connect_timeout=5, sslmode="require")
-            with conn.cursor() as cur:
-                cur.execute(
-                    "INSERT INTO public.usuarios_api (username, password_hash, full_name, role) "
-                    "VALUES (%s, %s, %s, %s) RETURNING *",
-                    (username, hashed, user_payload["full_name"], "USUARIO")
-                )
-                row = cur.fetchone()
-                conn.commit()
-                if row:
-                    created_user = dict(row)
-            conn.close()
-        except Exception as e:
-            ultimo_error = str(e)
-
     if not created_user:
         return jsonify({
             "success": False,
             "error": "Error al registrar usuario",
-            "mensaje": f"No se pudo guardar en Supabase. Detalle: {ultimo_error}"
+            "mensaje": f"No se pudo guardar en Supabase. {ultimo_error}"
         }), 500
 
     token = _create_jwt(created_user)
