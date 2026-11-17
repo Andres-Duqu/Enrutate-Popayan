@@ -42,18 +42,22 @@ function createApiClient(baseURL) {
   return instance
 }
 
+const isProd = import.meta.env.PROD
+
 export const apiRutas = createApiClient(
-  import.meta.env.VITE_RUTAS_URL || 'http://127.0.0.1:5001',
+  import.meta.env.VITE_RUTAS_URL || (isProd ? '/api' : 'http://127.0.0.1:5001'),
 )
 
 export const apiOperaciones = createApiClient(
-  import.meta.env.VITE_OPERACIONES_URL || 'http://127.0.0.1:5002',
+  import.meta.env.VITE_OPERACIONES_URL || (isProd ? '/api' : 'http://127.0.0.1:5002'),
 )
 
 export const apiMonitoreo = createApiClient(
-  import.meta.env.VITE_MONITOREO_URL || 'http://127.0.0.1:5003',
+  import.meta.env.VITE_MONITOREO_URL || (isProd ? '/api' : 'http://127.0.0.1:5003'),
 )
 
-const api = createApiClient(import.meta.env.VITE_API_URL || 'http://127.0.0.1:5000')
+const api = createApiClient(
+  import.meta.env.VITE_API_URL || (isProd ? '/api' : 'http://127.0.0.1:5000'),
+)
 
 export default api
