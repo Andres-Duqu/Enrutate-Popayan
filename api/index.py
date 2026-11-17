@@ -1,26 +1,23 @@
 import os
-import sys
-import datetime
-import hashlib
-import hmac
 import json
 import base64
-import requests
-from flask import Flask, jsonify, request
-from flask_cors import CORS
+import hashlib
+import hmac
+import datetime
+import urllib.request
+import urllib.error
+from flask import Flask, request, jsonify
 
 app = Flask(__name__)
-CORS(app)
 
 # ------------------------------------------------------------------------------
 # CONFIGURACIÓN Y AUTO-DETECCIÓN DE VARIABLES
 # ------------------------------------------------------------------------------
-DATABASE_URL = os.environ.get("DATABASE_URL", "").strip()
 SUPABASE_URL = os.environ.get("SUPABASE_URL", "").strip().rstrip("/")
 SUPABASE_KEY = os.environ.get("SUPABASE_KEY", "").strip()
 JWT_SECRET = os.environ.get("JWT_SECRET_KEY", "enrutate_jwt_secret_popayan_2026_default")
 
-# Si falta SUPABASE_URL en Vercel, auto-detectarlo
+# Si falta SUPABASE_URL en Vercel, auto-detectarlo desde la clave o fallback
 if not SUPABASE_URL:
     if SUPABASE_KEY and SUPABASE_KEY.startswith("eyJ"):
         try:
@@ -32,30 +29,59 @@ if not SUPABASE_URL:
                 project_ref = payload_json.get("ref")
                 if project_ref:
                     SUPABASE_URL = f"https://{project_ref}.supabase.co"
-        except Exception as e:
-            print(f"Error decodificando ref de JWT: {e}")
+        except Exception:
+            pass
 
-    # Fallback al ID del proyecto enrutate si no se definió
     if not SUPABASE_URL:
         SUPABASE_URL = "https://ppnonvpaqxmmnvayjuaw.supabase.co"
 
-# Cliente Supabase SDK (si se puede crear)
-supabase_client = None
-if SUPABASE_URL and SUPABASE_KEY:
+
+# ------------------------------------------------------------------------------
+# MIDDLEWARE CORS PURO (SIN DEPENDENCIAS)
+# ------------------------------------------------------------------------------
+@app.before_request
+def handle_preflight():
+    if request.method == "OPTIONS":
+        res = app.make_default_options_response()
+        res.headers["Access-Control-Allow-Origin"] = "*"
+        res.headers["Access-Control-Allow-Methods"] = "GET, POST, PUT, DELETE, OPTIONS"
+        res.headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization, apikey"
+        return res, 204
+
+
+@app.after_request
+def set_cors(response):
+    response.headers["Access-Control-Allow-Origin"] = "*"
+    response.headers["Access-Control-Allow-Methods"] = "GET, POST, PUT, DELETE, OPTIONS"
+    response.headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization, apikey"
+    return response
+
+
+# ------------------------------------------------------------------------------
+# CLIENTE HTTP NATIVO A SUPABASE REST
+# ------------------------------------------------------------------------------
+def _supabase_call(method, endpoint, body=None):
+    if not SUPABASE_URL or not SUPABASE_KEY:
+        return False, {"error": "Variables SUPABASE_URL o SUPABASE_KEY no configuradas en Vercel."}
+
+    url = f"{SUPABASE_URL}/rest/v1/{endpoint}"
+    data_bytes = json.dumps(body).encode("utf-8") if body is not None else None
+
+    req = urllib.request.Request(url, data=data_bytes, method=method)
+    req.add_header("apikey", SUPABASE_KEY)
+    req.add_header("Authorization", f"Bearer {SUPABASE_KEY}")
+    req.add_header("Content-Type", "application/json")
+    req.add_header("Prefer", "return=representation")
+
     try:
-        from supabase import create_client
-        supabase_client = create_client(SUPABASE_URL, SUPABASE_KEY)
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            raw = resp.read().decode("utf-8")
+            return True, json.loads(raw) if raw else {}
+    except urllib.error.HTTPError as e:
+        err_body = e.read().decode("utf-8")
+        return False, {"status": e.code, "message": err_body}
     except Exception as e:
-        print(f"Aviso SDK Supabase: {e}")
-
-
-def _get_headers():
-    return {
-        "apikey": SUPABASE_KEY,
-        "Authorization": f"Bearer {SUPABASE_KEY}",
-        "Content-Type": "application/json",
-        "Prefer": "return=representation"
-    }
+        return False, {"error": str(e)}
 
 
 def _check_pw(plain: str, hashed: str) -> bool:
@@ -63,12 +89,15 @@ def _check_pw(plain: str, hashed: str) -> bool:
         return False
     if plain == hashed:
         return True
-    try:
-        from werkzeug.security import check_password_hash
-        if hashed.startswith(("scrypt:", "pbkdf2:")):
-            return check_password_hash(hashed, plain)
-    except Exception:
-        pass
+    if hashed.startswith("pbkdf2:sha256:"):
+        try:
+            parts = hashed.split("$")
+            salt = parts[1]
+            target_hex = parts[2]
+            dk = hashlib.pbkdf2_hmac("sha256", plain.encode("utf-8"), salt.encode("utf-8"), 100000)
+            return hmac.compare_digest(dk.hex(), target_hex)
+        except Exception:
+            pass
     if len(hashed) == 64:
         legacy = hashlib.sha256(plain.encode("utf-8")).hexdigest()
         return hmac.compare_digest(legacy, hashed)
@@ -76,42 +105,22 @@ def _check_pw(plain: str, hashed: str) -> bool:
 
 
 def _hash_pw(plain: str) -> str:
-    try:
-        from werkzeug.security import generate_password_hash
-        return generate_password_hash(plain)
-    except Exception:
-        return hashlib.sha256(plain.encode("utf-8")).hexdigest()
+    salt = os.urandom(16).hex()
+    dk = hashlib.pbkdf2_hmac("sha256", plain.encode("utf-8"), salt.encode("utf-8"), 100000)
+    return f"pbkdf2:sha256:100000${salt}${dk.hex()}"
 
 
-def _get_user_db(username: str):
-    # 1. Via REST directo (el más rápido y compatible con Supabase)
-    if SUPABASE_URL and SUPABASE_KEY:
-        for table in ["usuarios_api", "users"]:
-            try:
-                url = f"{SUPABASE_URL}/rest/v1/{table}?username=eq.{username}&select=*"
-                r = requests.get(url, headers=_get_headers(), timeout=5)
-                if r.status_code == 200:
-                    data = r.json()
-                    if isinstance(data, list) and len(data) > 0:
-                        return data[0]
-            except Exception as e:
-                print(f"Error REST get_user: {e}")
-
-    # 2. Via SDK Supabase
-    if supabase_client:
-        for table in ["usuarios_api", "users"]:
-            try:
-                res = supabase_client.table(table).select("*").eq("username", username).execute()
-                if res.data and len(res.data) > 0:
-                    return res.data[0]
-            except Exception:
-                pass
-
+def _get_user(username: str):
+    for table in ["usuarios_api", "users"]:
+        ok, res = _supabase_call("GET", f"{table}?username=eq.{username}&select=*")
+        if ok and isinstance(res, list) and len(res) > 0:
+            return res[0]
     return None
 
 
 def _create_jwt(user: dict) -> str:
-    exp = datetime.datetime.utcnow() + datetime.timedelta(hours=24)
+    exp = int((datetime.datetime.utcnow() + datetime.timedelta(hours=24)).timestamp())
+    header = {"alg": "HS256", "typ": "JWT"}
     payload = {
         "sub": str(user.get("id", 1)),
         "username": user.get("username", ""),
@@ -119,26 +128,28 @@ def _create_jwt(user: dict) -> str:
         "full_name": user.get("full_name", user.get("username", "")),
         "exp": exp
     }
-    try:
-        import jwt
-        return jwt.encode(payload, JWT_SECRET, algorithm="HS256")
-    except Exception:
-        raw = f"{user.get('username')}:{user.get('role')}:{int(exp.timestamp())}"
-        return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+    h_b64 = base64.urlsafe_b64encode(json.dumps(header).encode()).rstrip(b'=').decode()
+    p_b64 = base64.urlsafe_b64encode(json.dumps(payload).encode()).rstrip(b'=').decode()
+    msg = f"{h_b64}.{p_b64}".encode()
+    sig = hmac.new(JWT_SECRET.encode(), msg, hashlib.sha256).digest()
+    s_b64 = base64.urlsafe_b64encode(sig).rstrip(b'=').decode()
+    return f"{h_b64}.{p_b64}.{s_b64}"
 
 
 # ==============================================================================
-# ENDPOINTS
+# ENDPOINTS REST DE LA APLICACIÓN
 # ==============================================================================
 
 @app.route("/", defaults={"path": ""})
 @app.route("/<path:path>", methods=["GET"])
 def health(path):
+    ok, test_res = _supabase_call("GET", "usuarios_api?select=id&limit=1")
     return jsonify({
         "servicio": "EnRutate Popayán API Gateway",
         "status": "online",
-        "supabase_configurado": bool(SUPABASE_URL and SUPABASE_KEY),
         "supabase_url": SUPABASE_URL,
+        "supabase_conectado": ok,
+        "supabase_respuesta": test_res if not ok else "OK",
         "key_presente": bool(SUPABASE_KEY),
         "key_tipo": "JWT" if SUPABASE_KEY.startswith("eyJ") else ("Secret" if SUPABASE_KEY.startswith("sb_") else "Otro")
     }), 200
@@ -159,7 +170,7 @@ def login():
             "mensaje": "Debe ingresar usuario y contraseña."
         }), 400
 
-    user = _get_user_db(username)
+    user = _get_user(username)
     if not user or not _check_pw(password, user.get("password_hash", "")):
         return jsonify({
             "success": False,
@@ -201,7 +212,7 @@ def register():
             "mensaje": "La contraseña debe tener al menos 6 caracteres."
         }), 400
 
-    if _get_user_db(username):
+    if _get_user(username):
         return jsonify({
             "success": False,
             "error": "Usuario duplicado",
@@ -216,41 +227,21 @@ def register():
         "role": "USUARIO"
     }
 
-    created_user = None
-    ultimo_error = ""
+    # Inserción directa en la tabla de usuarios de Supabase
+    ok, res = _supabase_call("POST", "usuarios_api", user_payload)
+    if not ok:
+        ok, res = _supabase_call("POST", "users", user_payload)
 
-    # 1. Inserción directa REST (compatible con claves sb_secret_ y claves eyJ...)
-    if SUPABASE_URL and SUPABASE_KEY:
-        for table in ["usuarios_api", "users"]:
-            try:
-                url = f"{SUPABASE_URL}/rest/v1/{table}"
-                r = requests.post(url, headers=_get_headers(), json=user_payload, timeout=6)
-                if r.status_code in (200, 201):
-                    res_data = r.json()
-                    created_user = res_data[0] if isinstance(res_data, list) and len(res_data) > 0 else user_payload
-                    break
-                else:
-                    ultimo_error = f"HTTP {r.status_code}: {r.text}"
-            except Exception as e:
-                ultimo_error = str(e)
-
-    # 2. Inserción via SDK Supabase
-    if not created_user and supabase_client:
-        try:
-            res = supabase_client.table("usuarios_api").insert(user_payload).execute()
-            if res.data:
-                created_user = res.data[0]
-        except Exception as e:
-            ultimo_error = str(e)
-
-    if not created_user:
+    if not ok:
         return jsonify({
             "success": False,
-            "error": "Error al registrar usuario",
-            "mensaje": f"No se pudo guardar en Supabase. {ultimo_error}"
+            "error": "Error al registrar usuario en Supabase",
+            "mensaje": str(res.get("message") or res)
         }), 500
 
+    created_user = res[0] if isinstance(res, list) and len(res) > 0 else user_payload
     token = _create_jwt(created_user)
+
     return jsonify({
         "success": True,
         "token": token,
@@ -270,16 +261,21 @@ def me():
 
     token = auth_header.split(" ", 1)[1].strip()
     try:
-        import jwt
-        payload = jwt.decode(token, JWT_SECRET, algorithms=["HS256"])
-        return jsonify({
-            "success": True,
-            "username": payload.get("username"),
-            "role": payload.get("role"),
-            "full_name": payload.get("full_name")
-        })
+        parts = token.split(".")
+        if len(parts) >= 2:
+            pad = len(parts[1]) % 4
+            padded = parts[1] + ("=" * (4 - pad) if pad else "")
+            payload = json.loads(base64.urlsafe_b64decode(padded).decode("utf-8"))
+            return jsonify({
+                "success": True,
+                "username": payload.get("username"),
+                "role": payload.get("role"),
+                "full_name": payload.get("full_name")
+            }), 200
     except Exception:
-        return jsonify({"error": "Token inválido o expirado"}), 401
+        pass
+
+    return jsonify({"error": "Token inválido o expirado"}), 401
 
 
 if __name__ == "__main__":
